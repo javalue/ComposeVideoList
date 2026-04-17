@@ -54,7 +54,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -111,10 +110,19 @@ private fun VideoGalleryApp() {
     val posts = remember { demoVideoPosts }
     val gridState = rememberLazyStaggeredGridState()
     var detailIndex by rememberSaveable { mutableStateOf<Int?>(null) }
-    val isDetailVisible by rememberUpdatedState(detailIndex != null)
-    var playerIsBuffering by remember { mutableStateOf(false) }
-    var playerErrorMessage by remember { mutableStateOf<String?>(null) }
-    val sharedPlayer = remember {
+    var activeSlot by remember { mutableStateOf(PlayerSlot.Primary) }
+    var requestedPostId by rememberSaveable { mutableStateOf<String?>(null) }
+    var primaryState by remember { mutableStateOf(PlayerSlotState()) }
+    var secondaryState by remember { mutableStateOf(PlayerSlotState()) }
+    val primaryPlayer = remember {
+        ExoPlayer.Builder(context)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(context.videoCacheDataSourceFactory()))
+            .build()
+            .apply {
+                repeatMode = Player.REPEAT_MODE_ONE
+            }
+    }
+    val secondaryPlayer = remember {
         ExoPlayer.Builder(context)
             .setMediaSourceFactory(DefaultMediaSourceFactory(context.videoCacheDataSourceFactory()))
             .build()
@@ -123,47 +131,145 @@ private fun VideoGalleryApp() {
             }
     }
 
-    DisposableEffect(sharedPlayer, lifecycleOwner) {
-        val playerListener = object : Player.Listener {
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                playerIsBuffering = playbackState == Player.STATE_BUFFERING
-                if (playbackState == Player.STATE_READY || playbackState == Player.STATE_ENDED) {
-                    playerIsBuffering = false
+    fun playerFor(slot: PlayerSlot): ExoPlayer {
+        return if (slot == PlayerSlot.Primary) primaryPlayer else secondaryPlayer
+    }
+
+    fun stateFor(slot: PlayerSlot): PlayerSlotState {
+        return if (slot == PlayerSlot.Primary) primaryState else secondaryState
+    }
+
+    fun updateState(slot: PlayerSlot, state: PlayerSlotState) {
+        if (slot == PlayerSlot.Primary) {
+            primaryState = state
+        } else {
+            secondaryState = state
+        }
+    }
+
+    fun activateSlot(slot: PlayerSlot) {
+        val nextPlayer = playerFor(slot)
+        if (slot != activeSlot) {
+            playerFor(activeSlot).pause()
+            activeSlot = slot
+        }
+        nextPlayer.playWhenReady = true
+        nextPlayer.play()
+    }
+
+    DisposableEffect(primaryPlayer, secondaryPlayer, lifecycleOwner) {
+        fun buildListener(
+            slot: PlayerSlot,
+            player: ExoPlayer
+        ): Player.Listener {
+            return object : Player.Listener {
+                override fun onPlaybackStateChanged(playbackState: Int) {
+                    val mediaId = player.currentMediaItem?.mediaId
+                    val currentState = stateFor(slot)
+                    val nextState = currentState.copy(
+                        mediaId = mediaId,
+                        isBuffering = playbackState == Player.STATE_BUFFERING,
+                        isReady = playbackState == Player.STATE_READY,
+                        errorMessage = if (playbackState == Player.STATE_READY) null else currentState.errorMessage
+                    )
+                    updateState(slot, nextState)
+
+                    if (playbackState == Player.STATE_READY && mediaId != null && mediaId == requestedPostId) {
+                        activateSlot(slot)
+                    }
                 }
-            }
 
-            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                playerErrorMessage = error.errorCodeName
-                playerIsBuffering = false
-            }
-
-            override fun onIsPlayingChanged(isPlaying: Boolean) {
-                if (isPlaying) {
-                    playerErrorMessage = null
-                    playerIsBuffering = false
+                override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                    updateState(
+                        slot,
+                        stateFor(slot).copy(
+                            mediaId = player.currentMediaItem?.mediaId,
+                            isBuffering = false,
+                            isReady = false,
+                            errorMessage = error.errorCodeName
+                        )
+                    )
                 }
             }
         }
 
+        val primaryListener = buildListener(PlayerSlot.Primary, primaryPlayer)
+        val secondaryListener = buildListener(PlayerSlot.Secondary, secondaryPlayer)
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_RESUME -> {
-                    if (isDetailVisible) {
-                        sharedPlayer.play()
+                    if (detailIndex != null) {
+                        playerFor(activeSlot).play()
                     }
                 }
 
-                Lifecycle.Event.ON_PAUSE -> sharedPlayer.pause()
+                Lifecycle.Event.ON_PAUSE -> {
+                    primaryPlayer.pause()
+                    secondaryPlayer.pause()
+                }
+
                 else -> Unit
             }
         }
 
-        sharedPlayer.addListener(playerListener)
+        primaryPlayer.addListener(primaryListener)
+        secondaryPlayer.addListener(secondaryListener)
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
-            sharedPlayer.removeListener(playerListener)
+            primaryPlayer.removeListener(primaryListener)
+            secondaryPlayer.removeListener(secondaryListener)
             lifecycleOwner.lifecycle.removeObserver(observer)
-            sharedPlayer.release()
+            primaryPlayer.release()
+            secondaryPlayer.release()
+        }
+    }
+
+    fun requestPost(post: VideoPost) {
+        requestedPostId = post.id
+
+        val activeState = stateFor(activeSlot)
+        if (activeState.mediaId == post.id && activeState.isReady) {
+            val currentPlayer = playerFor(activeSlot)
+            currentPlayer.seekTo(0L)
+            activateSlot(activeSlot)
+            return
+        }
+
+        val readySlot = when {
+            primaryState.mediaId == post.id && primaryState.isReady -> PlayerSlot.Primary
+            secondaryState.mediaId == post.id && secondaryState.isReady -> PlayerSlot.Secondary
+            else -> null
+        }
+
+        if (readySlot != null) {
+            playerFor(readySlot).seekTo(0L)
+            activateSlot(readySlot)
+            return
+        }
+
+        val preloadSlot = activeSlot.other()
+        val preloadPlayer = playerFor(preloadSlot)
+        val preloadState = stateFor(preloadSlot)
+        updateState(
+            preloadSlot,
+            PlayerSlotState(
+                mediaId = post.id,
+                isBuffering = true,
+                isReady = false,
+                errorMessage = null
+            )
+        )
+
+        if (preloadState.mediaId != post.id) {
+            preloadPlayer.playWhenReady = false
+            preloadPlayer.clearMediaItems()
+            preloadPlayer.setMediaItem(
+                MediaItem.Builder()
+                    .setMediaId(post.id)
+                    .setUri(post.videoUrl)
+                    .build()
+            )
+            preloadPlayer.prepare()
         }
     }
 
@@ -173,7 +279,8 @@ private fun VideoGalleryApp() {
 
     LaunchedEffect(detailIndex) {
         if (detailIndex == null) {
-            sharedPlayer.pause()
+            primaryPlayer.pause()
+            secondaryPlayer.pause()
         }
     }
 
@@ -216,32 +323,13 @@ private fun VideoGalleryApp() {
                 DetailPagerScreen(
                     posts = posts,
                     initialIndex = selectedIndex,
-                    player = sharedPlayer,
-                    isPlayerBuffering = playerIsBuffering,
-                    playerErrorMessage = playerErrorMessage,
-                    onPlayPost = { post ->
-                        playerErrorMessage = null
-                        playerIsBuffering = true
-                        val currentUri = sharedPlayer.currentMediaItem
-                            ?.localConfiguration
-                            ?.uri
-                            ?.toString()
-
-                        if (currentUri != post.videoUrl) {
-                            sharedPlayer.setMediaItem(
-                                MediaItem.Builder()
-                                    .setMediaId(post.id)
-                                    .setUri(post.videoUrl)
-                                    .build()
-                            )
-                            sharedPlayer.prepare()
-                        } else {
-                            sharedPlayer.seekTo(0L)
-                        }
-
-                        sharedPlayer.playWhenReady = true
-                        sharedPlayer.play()
-                    },
+                    primaryPlayer = primaryPlayer,
+                    secondaryPlayer = secondaryPlayer,
+                    activeSlot = activeSlot,
+                    requestedPostId = requestedPostId,
+                    primaryState = primaryState,
+                    secondaryState = secondaryState,
+                    onPlayPost = ::requestPost,
                     onBack = { detailIndex = null }
                 )
             }
@@ -422,9 +510,12 @@ private fun FeedCard(
 private fun DetailPagerScreen(
     posts: List<VideoPost>,
     initialIndex: Int,
-    player: ExoPlayer,
-    isPlayerBuffering: Boolean,
-    playerErrorMessage: String?,
+    primaryPlayer: ExoPlayer,
+    secondaryPlayer: ExoPlayer,
+    activeSlot: PlayerSlot,
+    requestedPostId: String?,
+    primaryState: PlayerSlotState,
+    secondaryState: PlayerSlotState,
     onPlayPost: (VideoPost) -> Unit,
     onBack: () -> Unit
 ) {
@@ -432,6 +523,8 @@ private fun DetailPagerScreen(
         initialPage = initialIndex,
         pageCount = { posts.size }
     )
+    val activePlayer = if (activeSlot == PlayerSlot.Primary) primaryPlayer else secondaryPlayer
+    val activePlayerState = if (activeSlot == PlayerSlot.Primary) primaryState else secondaryState
 
     LaunchedEffect(pagerState.currentPage, posts) {
         onPlayPost(posts[pagerState.currentPage])
@@ -447,12 +540,25 @@ private fun DetailPagerScreen(
             beyondViewportPageCount = 1,
             modifier = Modifier.fillMaxSize()
         ) { page ->
+            val isCurrentPage = pagerState.currentPage == page
+            val pageState = when (posts[page].id) {
+                primaryState.mediaId -> primaryState
+                secondaryState.mediaId -> secondaryState
+                requestedPostId -> PlayerSlotState(
+                    mediaId = requestedPostId,
+                    isBuffering = true,
+                    isReady = false,
+                    errorMessage = null
+                )
+                else -> PlayerSlotState()
+            }
+
             DetailPage(
                 post = posts[page],
-                player = player,
-                isActive = pagerState.currentPage == page,
-                isBuffering = pagerState.currentPage == page && isPlayerBuffering,
-                errorMessage = if (pagerState.currentPage == page) playerErrorMessage else null
+                player = if (isCurrentPage && activePlayerState.mediaId == posts[page].id) activePlayer else null,
+                isActive = isCurrentPage,
+                isBuffering = isCurrentPage && pageState.isBuffering,
+                errorMessage = if (isCurrentPage) pageState.errorMessage else null
             )
         }
 
@@ -495,21 +601,12 @@ private fun DetailPagerScreen(
 @Composable
 private fun DetailPage(
     post: VideoPost,
-    player: ExoPlayer,
+    player: ExoPlayer?,
     isActive: Boolean,
     isBuffering: Boolean,
     errorMessage: String?
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
-        AsyncImage(
-            model = ImageRequest.Builder(LocalContext.current)
-                .data(post.coverUrl)
-                .crossfade(true)
-                .build(),
-            contentDescription = post.title,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxSize()
-        )
         VideoPlayer(
             player = if (isActive) player else null,
             isBuffering = isBuffering,
@@ -593,6 +690,7 @@ private fun DetailPage(
     }
 }
 
+@androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 private fun VideoPlayer(
     player: ExoPlayer?,
@@ -605,6 +703,7 @@ private fun VideoPlayer(
             factory = { viewContext ->
                 PlayerView(viewContext).apply {
                     useController = false
+                    setKeepContentOnPlayerReset(false)
                     resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                     this.player = player
                     setShowBuffering(PlayerView.SHOW_BUFFERING_NEVER)
@@ -646,6 +745,23 @@ private fun VideoPlayer(
     }
 }
 
+private enum class PlayerSlot {
+    Primary,
+    Secondary;
+
+    fun other(): PlayerSlot {
+        return if (this == Primary) Secondary else Primary
+    }
+}
+
+private data class PlayerSlotState(
+    val mediaId: String? = null,
+    val isBuffering: Boolean = false,
+    val isReady: Boolean = false,
+    val errorMessage: String? = null
+)
+
+@UnstableApi
 private fun Context.videoCacheDataSourceFactory(): CacheDataSource.Factory {
     val appContext = applicationContext
     val upstreamFactory = DefaultDataSource.Factory(appContext)
@@ -655,6 +771,7 @@ private fun Context.videoCacheDataSourceFactory(): CacheDataSource.Factory {
         .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
 }
 
+@UnstableApi
 private object VideoCacheHolder {
     @Volatile
     private var simpleCache: SimpleCache? = null
